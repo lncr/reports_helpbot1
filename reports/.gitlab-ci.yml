@@ -1,0 +1,197 @@
+stages:
+  - test
+  - build
+  - deploy to registry
+  - proxy check
+  - deploy
+  - grafana check
+  - cleanup
+
+.poetry-extras:
+  variables:
+    PIP_NO_CACHE_DIR: "off"
+  before_script:
+    - curl -sSL https://install.python-poetry.org | python -
+    - export PATH=$PATH:$HOME/.local/bin
+    - poetry config virtualenvs.create false
+    - poetry install --no-interaction --no-ansi --no-cache
+
+test:
+  stage: test
+  image: python:3.12.4
+  extends:
+    - .poetry-extras
+  script:
+    - make
+
+docker_build:
+  stage: build
+  image: docker:19.03.0
+  variables:
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: "/certs"
+  services:
+    - docker:19.03.0-dind
+  tags:
+    - docker
+  before_script:
+    - docker info
+  script:
+    - docker build .
+  needs:
+    - job: test
+  rules:
+    - if: $CI_COMMIT_BRANCH != "master" && $CI_COMMIT_BRANCH != "development" && $CI_PIPELINE_SOURCE == "push"
+
+docker_deploy_to_registry:
+  stage: deploy to registry
+  image: docker:latest
+  tags:
+    - docker
+  services:
+    - docker:dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build --pull -t "$CI_REGISTRY_IMAGE:$TAG" .
+    - docker push "$CI_REGISTRY_IMAGE:$TAG"
+  after_script:
+    - docker logout $CI_REGISTRY
+  environment:
+    name: $ENVIRONMENT
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE == "push"
+      variables:
+        TAG: "latest"
+        ENVIRONMENT: "production"
+    - if: $CI_COMMIT_BRANCH == "development" && $CI_PIPELINE_SOURCE == "push"
+      variables:
+        TAG: "development"
+        ENVIRONMENT: "development"
+
+
+proxy_check:
+  stage: proxy check
+  image: ubuntu
+  before_script:
+    - "which ssh-agent || ( apt-get update -y && apt-get install openssh-client git -y )"
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan $SERVICE_IP >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  script:
+    - scp -r ./.gitlab/proxy_check.sh cicd@$SERVICE_IP:./proxy_check.sh
+    - ssh -o StrictHostKeyChecking=no cicd@$SERVICE_IP "sudo bash /home/cicd/proxy_check.sh"
+  environment:
+    name: $ENVIRONMENT
+    url: $SERVICE_URL
+  tags:
+    - docker
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE == "push"
+      variables:
+        ENVIRONMENT: "production"
+    - if: $CI_COMMIT_BRANCH == "development" && $CI_PIPELINE_SOURCE == "push"
+      variables:
+        ENVIRONMENT: "development"
+  needs:
+    - job: docker_deploy_to_registry
+
+deploy:
+  stage: deploy
+  image: ubuntu
+  before_script:
+    - "which ssh-agent || ( apt-get update -y && apt-get install openssh-client git -y )"
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan $SERVICE_IP >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  script:
+    - env |grep "ENV_" | awk -F "ENV_" '{print $2}' >> ./env.list
+    - scp ./env.list cicd@$SERVICE_IP:./
+    - ssh -o StrictHostKeyChecking=no cicd@$SERVICE_IP "sudo docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY"
+    - ssh -o StrictHostKeyChecking=no cicd@$SERVICE_IP "sudo docker pull $CI_REGISTRY_IMAGE:$TAG"
+    - ssh -o StrictHostKeyChecking=no cicd@$SERVICE_IP "sudo docker stop $CI_PROJECT_NAME || true"
+    - ssh -o StrictHostKeyChecking=no cicd@$SERVICE_IP "sudo docker rm $CI_PROJECT_NAME || true"
+    - ssh -o StrictHostKeyChecking=no cicd@$SERVICE_IP "sudo docker run
+      --env-file /home/cicd/env.list
+      --env VIRTUAL_HOST=$DOMAIN
+      --env VIRTUAL_PORT=$SERVER_PORT
+      --env LETSENCRYPT_HOST=$DOMAIN
+      --env LETSENCRYPT_EMAIL=$SSL_DEFAULT_EMAIL
+      --restart=always
+      --log-driver json-file
+      --log-opt max-size=100m
+      --log-opt max-file=3
+      --network=nginx-proxy
+      --name ${CI_PROJECT_NAME}
+      -d -p $SERVER_PORT:$APP_PORT $CI_REGISTRY_IMAGE:$TAG"
+    - ssh -o StrictHostKeyChecking=no cicd@$SERVICE_IP "sudo docker image prune --filter=dangling=true -f"
+    - ssh -o StrictHostKeyChecking=no cicd@$SERVICE_IP "sudo docker logout $CI_REGISTRY"
+    - ssh -o StrictHostKeyChecking=no cicd@$SERVICE_IP "sudo rm /home/cicd/env.list"
+  environment:
+    name: $ENVIRONMENT
+    url: $SERVICE_URL
+  tags:
+    - docker
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE == "push"
+      variables:
+        TAG: "latest"
+        ENVIRONMENT: "production"
+    - if: $CI_COMMIT_BRANCH == "development" && $CI_PIPELINE_SOURCE == "push"
+      variables:
+        TAG: "development"
+        ENVIRONMENT: "development"
+  needs:
+    - job: proxy_check
+
+grafana_check:
+  stage: grafana check
+  image: ubuntu
+  before_script:
+    - "which ssh-agent || ( apt-get update -y && apt-get install gettext-base openssh-client git -y )"
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan $SERVICE_IP >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  script:
+    - envsubst < ./.gitlab/docker-compose.exporters.yml > docker-compose.exporters.yml
+    - scp -r ./docker-compose.exporters.yml cicd@$SERVICE_IP:./docker-compose.exporters.yml
+    - scp -r ./.gitlab/Caddyfile cicd@$SERVICE_IP:./Caddyfile
+    - scp -r ./.gitlab/grafana_exporters_check.sh cicd@$SERVICE_IP:./grafana_exporters_check.sh
+    - ssh -o StrictHostKeyChecking=no cicd@$SERVICE_IP "sudo bash /home/cicd/grafana_exporters_check.sh"
+    - ssh cicd@$SERVICE_IP "sudo rm -rf docker-compose.exporters.yml"
+    - ssh cicd@$SERVICE_IP "sudo rm -rf Caddyfile"
+    - ssh cicd@$SERVICE_IP "sudo rm -rf grafana_exporters_check.sh"
+    - rm -rf ./docker-compose.exporters.yml
+  environment:
+    name: $ENVIRONMENT
+  needs:
+    - job: deploy
+  tags:
+    - docker
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE == "push"
+      variables:
+        ENVIRONMENT: "production"
+
+docker_prune:
+  stage: cleanup
+  tags:
+    - docker
+  script:
+    - docker system prune -af --volumes
+  needs:
+    - job: docker_build
+      optional: true
+    - job: deploy
+      optional: true
+    - job: docker_deploy_to_registry
+      optional: true
